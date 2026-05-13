@@ -27,7 +27,17 @@ import streamlit.components.v1 as components
 
 import py3Dmol
 from rdkit import Chem
-from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors, Draw
+from rdkit.Chem import AllChem, Descriptors, rdMolDescriptors
+
+# Draw needs native rendering libs (Cairo / Pillow + boost). On some hosts
+# (e.g. brand-new Python builds without matching rdkit wheels) the import
+# fails. The 2D depiction is a "nice to have", so degrade gracefully.
+try:
+    from rdkit.Chem import Draw  # type: ignore
+    _DRAW_AVAILABLE = True
+except Exception:  # pragma: no cover — host-dependent
+    Draw = None  # type: ignore
+    _DRAW_AVAILABLE = False
 
 
 # ---------------------------------------------------------------------------
@@ -480,11 +490,19 @@ def render_main(data: MoleculeData, options: dict) -> None:
                              use_container_width=True)
 
             with st.expander("2D depiction"):
-                try:
-                    img = Draw.MolToImage(Chem.RemoveHs(data.mol), size=(360, 280))
-                    st.image(img, use_column_width=True)
-                except Exception:
-                    st.write("2D depiction unavailable.")
+                if not _DRAW_AVAILABLE:
+                    st.write(
+                        "2D depiction unavailable on this host "
+                        "(rdkit.Chem.Draw could not be imported)."
+                    )
+                else:
+                    try:
+                        img = Draw.MolToImage(
+                            Chem.RemoveHs(data.mol), size=(360, 280)
+                        )
+                        st.image(img, use_column_width=True)
+                    except Exception as exc:
+                        st.write(f"2D depiction unavailable: {exc}")
 
             with st.expander("Download"):
                 mol_block = Chem.MolToMolBlock(data.mol)
