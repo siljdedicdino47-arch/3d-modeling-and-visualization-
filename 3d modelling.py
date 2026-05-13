@@ -23,6 +23,7 @@ Required libraries:
 
 from __future__ import annotations
 
+import json
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -78,9 +79,66 @@ class MoleculeData:
 # Molecule parsing / construction
 # ---------------------------------------------------------------------------
 
+def _embed_3d(mol: Chem.Mol) -> bool:
+    """Robust multi-strategy 3D embedding.
+
+    Big polycyclic / stereo-heavy molecules (e.g. taxol, vancomycin) routinely
+    fail ETKDGv3 with default settings. We escalate through several attempts
+    before giving up.
+    """
+    # Strategy 1 — ETKDGv3 with multiple seeds and macrocycle-aware torsions.
+    for seed in (42, 1, 7, 23, 12345):
+        params = AllChem.ETKDGv3()
+        params.randomSeed = seed
+        params.maxAttempts = 200
+        params.useSmallRingTorsions = True
+        params.useMacrocycleTorsions = True
+        params.useBasicKnowledge = True
+        params.enforceChirality = True
+        params.ignoreSmoothingFailures = True
+        if AllChem.EmbedMolecule(mol, params) == 0:
+            return True
+
+    # Strategy 2 — same, but allow random starting coordinates.
+    for seed in (42, 1, 7, 23):
+        params = AllChem.ETKDGv3()
+        params.randomSeed = seed
+        params.maxAttempts = 500
+        params.useRandomCoords = True
+        params.useSmallRingTorsions = True
+        params.useMacrocycleTorsions = True
+        params.ignoreSmoothingFailures = True
+        if AllChem.EmbedMolecule(mol, params) == 0:
+            return True
+
+    # Strategy 3 — older ETKDGv2.
+    try:
+        params = AllChem.ETKDGv2()
+        params.randomSeed = 42
+        params.maxAttempts = 500
+        params.useRandomCoords = True
+        if AllChem.EmbedMolecule(mol, params) == 0:
+            return True
+    except Exception:
+        pass
+
+    # Strategy 4 — plain distance-geometry embed with random coords.
+    if AllChem.EmbedMolecule(mol, useRandomCoords=True,
+                             maxAttempts=1000) == 0:
+        return True
+
+    return False
+
+
 def mol_from_smiles(smiles: str, add_hs: bool = True,
                     optimize: bool = True) -> MoleculeData:
-    """Build a 3D molecule from a SMILES string using RDKit + MMFF94/UFF."""
+    """Build a 3D molecule from a SMILES string using RDKit + MMFF94/UFF.
+
+    Falls back through multiple embedding strategies for difficult molecules
+    (taxol, vancomycin, large macrocycles). If all 3D embedding fails, we
+    use 2D coordinates so the user still sees *something* rather than a
+    crash.
+    """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Invalid SMILES string: {smiles!r}")
@@ -88,16 +146,19 @@ def mol_from_smiles(smiles: str, add_hs: bool = True,
     if add_hs:
         mol = Chem.AddHs(mol)
 
-    params = AllChem.ETKDGv3()
-    params.randomSeed = 42
-    if AllChem.EmbedMolecule(mol, params) != 0:
-        AllChem.EmbedMolecule(mol, useRandomCoords=True)
+    embedded_3d = _embed_3d(mol)
+    if not embedded_3d:
+        # 2D fallback. The molecule will be flat but still render.
+        AllChem.Compute2DCoords(mol)
 
-    if optimize:
+    if optimize and embedded_3d:
         try:
-            AllChem.MMFFOptimizeMolecule(mol, maxIters=400)
+            AllChem.MMFFOptimizeMolecule(mol, maxIters=500)
         except Exception:
-            AllChem.UFFOptimizeMolecule(mol, maxIters=400)
+            try:
+                AllChem.UFFOptimizeMolecule(mol, maxIters=500)
+            except Exception:
+                pass  # leave unoptimized
 
     block = Chem.MolToMolBlock(mol)
     return MoleculeData(mol=mol, block=block, fmt="mol", name=smiles)
@@ -174,6 +235,112 @@ def fetch_pubchem(query: str, by: str = "name") -> MoleculeData:
     mol = next((m for m in supplier if m is not None), None)
     block = Chem.MolToMolBlock(mol) if mol is not None else text
     return MoleculeData(mol=mol, block=block, fmt="sdf", name=q)
+
+
+@st.cache_data(show_spinner=False)
+def fetch_names(*, smiles: str | None = None, inchikey: str | None = None,
+                cid: str | None = None, name_hint: str | None = None) -> dict:
+    """Look up common name, IUPAC name, and synonyms from PubChem.
+
+    Provide any one of smiles / inchikey / cid (in that preference order).
+    Returns a dict with keys: common, iupac, synonyms (list), cid (str or
+    None), formula, molecular_weight. Missing values are None / [].
+    """
+    info = {
+        "common": None,
+        "iupac": None,
+        "synonyms": [],
+        "cid": cid,
+        "formula": None,
+        "molecular_weight": None,
+        "input_hint": name_hint,
+    }
+
+    def _resolve_cid() -> str | None:
+        if cid:
+            return cid
+        if inchikey:
+            try:
+                txt = _http_get(
+                    f"{_PUBCHEM}/inchikey/{urllib.parse.quote(inchikey)}/cids/TXT"
+                )
+                first = txt.strip().splitlines()[0].strip()
+                return first or None
+            except Exception:
+                return None
+        if smiles:
+            try:
+                txt = _http_get(
+                    f"{_PUBCHEM}/smiles/{urllib.parse.quote(smiles)}/cids/TXT"
+                )
+                first = txt.strip().splitlines()[0].strip()
+                return first if first and first != "0" else None
+            except Exception:
+                return None
+        if name_hint:
+            try:
+                txt = _http_get(
+                    f"{_PUBCHEM}/name/{urllib.parse.quote(name_hint)}/cids/TXT"
+                )
+                first = txt.strip().splitlines()[0].strip()
+                return first or None
+            except Exception:
+                return None
+        return None
+
+    resolved_cid = _resolve_cid()
+    info["cid"] = resolved_cid
+    if not resolved_cid:
+        return info
+
+    # Bulk-fetch properties.
+    try:
+        url = (f"{_PUBCHEM}/cid/{resolved_cid}/property/"
+               "IUPACName,MolecularFormula,MolecularWeight/JSON")
+        data = json.loads(_http_get(url))
+        props = data["PropertyTable"]["Properties"][0]
+        info["iupac"] = props.get("IUPACName")
+        info["formula"] = props.get("MolecularFormula")
+        mw = props.get("MolecularWeight")
+        info["molecular_weight"] = float(mw) if mw is not None else None
+    except Exception:
+        pass
+
+    # Synonyms (the first synonym is usually the common / trade name).
+    try:
+        url = f"{_PUBCHEM}/cid/{resolved_cid}/synonyms/JSON"
+        data = json.loads(_http_get(url))
+        syns = data["InformationList"]["Information"][0].get("Synonym", [])
+        info["synonyms"] = syns
+        if syns:
+            # The first synonym from PubChem is almost always the common name.
+            info["common"] = syns[0]
+    except Exception:
+        pass
+
+    return info
+
+
+def lookup_names_for(data: MoleculeData) -> dict:
+    """Best-effort PubChem name lookup for any MoleculeData."""
+    mol = data.mol
+    smiles = None
+    inchikey = None
+    name_hint = data.name or None
+
+    if mol is not None:
+        try:
+            smiles = Chem.MolToSmiles(Chem.RemoveHs(mol))
+        except Exception:
+            smiles = None
+        try:
+            inchikey = Chem.MolToInchiKey(mol) or None
+        except Exception:
+            inchikey = None
+
+    return fetch_names(
+        smiles=smiles, inchikey=inchikey, name_hint=name_hint,
+    )
 
 
 @st.cache_data(show_spinner=False)
@@ -541,6 +708,14 @@ EXAMPLES = {
     "Ibuprofen": "CC(C)Cc1ccc(cc1)C(C)C(=O)O",
     "Cholesterol": "CC(C)CCC[C@@H](C)[C@H]1CC[C@@H]2[C@@]1(CC[C@H]3[C@H]2CC=C4[C@@]3(CC[C@@H](C4)O)C)C",
     "Paracetamol": "CC(=O)Nc1ccc(O)cc1",
+    # Paclitaxel (taxol) — PubChem CID 36314 canonical SMILES.
+    "Taxol (paclitaxel)":
+        "CC1=C2C(C(=O)C3(C(CC4C(C3C(C(C2(C)C)(CC1OC(=O)C(C(C5=CC=CC=C5)"
+        "NC(=O)C6=CC=CC=C6)O)O)OC(=O)C7=CC=CC=C7)(CO4)OC(=O)C)O)C)OC(=O)C",
+    # Atorvastatin (Lipitor) — large drug-like molecule, embeds reliably.
+    "Atorvastatin":
+        "CC(C)c1c(C(=O)Nc2ccccc2)c(-c2ccccc2)c(-c2ccc(F)cc2)n1CC[C@@H]"
+        "(O)C[C@@H](O)CC(=O)O",
 }
 
 
@@ -761,11 +936,65 @@ def downloads_panel(data: MoleculeData) -> None:
         )
 
 
+def render_names_header(data: MoleculeData) -> None:
+    """Top-of-view header with common / chemical / IUPAC names from PubChem."""
+    with st.spinner("Looking up names on PubChem…"):
+        names = lookup_names_for(data)
+
+    common = names.get("common") or data.name or "—"
+    iupac = names.get("iupac") or "—"
+    synonyms = names.get("synonyms") or []
+    cid = names.get("cid")
+
+    # Chemical name = a representative alternative from the synonym list.
+    chemical = "—"
+    for syn in synonyms[1:]:
+        # Skip CAS-style numeric IDs and pure registry codes.
+        s = syn.strip()
+        if not s or s.replace("-", "").isdigit():
+            continue
+        if s.lower() == (common or "").lower():
+            continue
+        chemical = s
+        break
+
+    st.markdown(f"### {common}")
+    cols = st.columns(2)
+    with cols[0]:
+        st.markdown(f"**Chemical name** — {chemical}")
+    with cols[1]:
+        if cid:
+            st.markdown(
+                f"**PubChem CID** — "
+                f"[{cid}](https://pubchem.ncbi.nlm.nih.gov/compound/{cid})"
+            )
+        else:
+            st.markdown("**PubChem CID** — not found")
+    st.markdown(f"**IUPAC name** — {iupac}")
+
+    if synonyms:
+        with st.expander(f"More synonyms ({len(synonyms)})"):
+            # Cap to avoid flooding the UI for famous molecules like aspirin.
+            shown = synonyms[:50]
+            st.write(", ".join(shown))
+            if len(synonyms) > 50:
+                st.caption(f"showing first 50 of {len(synonyms)}")
+    elif cid is None:
+        st.caption(
+            "Couldn't resolve this structure on PubChem. The 3D view still "
+            "works — IUPAC / common names are only available for known "
+            "compounds."
+        )
+
+
 def render_main(data: MoleculeData, options: dict) -> None:
+    render_names_header(data)
+    st.divider()
+
     left, right = st.columns([2, 1], gap="large")
 
     with left:
-        st.subheader(f"3D view — {data.name or 'molecule'}")
+        st.subheader("3D view")
         html = build_view(data, **options)
         components.html(html, height=600, scrolling=False)
         st.caption(
